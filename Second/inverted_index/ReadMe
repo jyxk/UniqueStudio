@@ -1,0 +1,4 @@
+c++真香
+在被redis和莫名其妙的core dump折磨了一个星期之后用C with STL写完了
+输入：./search path word
+输出：path下所有MIME type为text/plain 文件中word的索引信息
