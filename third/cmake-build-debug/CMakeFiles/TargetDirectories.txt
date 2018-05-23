@@ -1,0 +1,3 @@
+/home/jyxk/Code/FreshMan/third/cmake-build-debug/CMakeFiles/edit_cache.dir
+/home/jyxk/Code/FreshMan/third/cmake-build-debug/CMakeFiles/rebuild_cache.dir
+/home/jyxk/Code/FreshMan/third/cmake-build-debug/CMakeFiles/DnsServer.dir
