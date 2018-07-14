@@ -13,6 +13,8 @@
 #include <iomanip>
 #include <unistd.h>
 #include <netdb.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include "hosts.h"
 #define DEF_DNS_ADDRESS "119.29.29.29"	//外部DNS服务器地址
 #define LOCAL_ADDRESS "127.0.0.1"		//本地DNS服务器地址
@@ -22,6 +24,10 @@
 #define AMOUNT 300
 #define NOTFOUND (-1)
 #define SOCKET_ERROR (-1)
+#define CONTINUE (-1)
+#define END (1)
+#define BREAK (0)
+
 using namespace std;
 //DNS报文首部
 typedef struct DNSHeader
@@ -52,7 +58,7 @@ typedef struct IDChange
 Translate DNS_table[AMOUNT];		//DNS域名解析表
 IDTransform IDTransTable[AMOUNT];	//ID转换表
 int IDcount = 0;					//转换表中的条目个数
-string url;					//域名
+string url;					        //域名
 Hosts *hosts = new Hosts();
 
 int hostname_to_ip(const char * hostname, char* ip) {
@@ -213,6 +219,149 @@ void DisplayInfo(unsigned short newID, bool find)
 	}
 }
 
+int DateHandle(char *recvbuf, size_t *iRecv, size_t *iSend, socklen_t *iLen_cli,
+               struct sockaddr_in *client_name, struct sockaddr_in *server_name,
+               int socket_server, int socket_local, char *sendbuf) {
+    unordered_map<string, string> &result = hosts->result_index();
+    GetUrl(recvbuf, *iRecv);				//获取域名
+    bool find = true;		                //在域名解析表中查找
+    cout << "*"<<result[url]<<"*"<<url<<"*" << endl;
+
+    if (result[url].empty())
+        find = false;
+
+    int state = END;
+
+    //在域名解析表中没有找到
+    if (!find) {
+        //ID转换
+        auto pID = (unsigned short *)malloc(sizeof(unsigned short));
+        memcpy(pID, recvbuf, sizeof(unsigned short));
+        unsigned short nID = htons(RegisterNewID(ntohs(*pID), *client_name, false));
+        memcpy(recvbuf, &nID, sizeof(unsigned short));
+
+        //打印
+        DisplayInfo(ntohs(nID), find);
+
+        //把recvbuf转发至指定的外部DNS服务器
+        *iSend = sendto(socket_server, recvbuf, *iRecv, 0, (sockaddr*)server_name, sizeof(*server_name));
+        if (*iSend == SOCKET_ERROR) {
+            printf("sendto failed.\n");
+            state = CONTINUE;
+            goto HELL;
+        }
+        else if (*iSend == 0) {
+            state = BREAK;
+            goto HELL;
+        }
+
+        free(pID);	//释放动态分配的内存
+
+        //接收来自外部DNS服务器的响应报文
+        *iRecv = recvfrom(socket_server, recvbuf, strlen(recvbuf), 0, (sockaddr*)client_name, iLen_cli);
+
+        //ID转换
+        pID = (unsigned short *)malloc(sizeof(unsigned short));
+        memcpy(pID, recvbuf, sizeof(unsigned short));
+        int m = ntohs(*pID);
+        unsigned short oID = htons(IDTransTable[m].oldID);
+        memcpy(recvbuf, &oID, sizeof(unsigned short));
+        IDTransTable[m].done = true;
+
+        //从ID转换表中获取发出DNS请求者的信息
+        *client_name = IDTransTable[m].client;
+
+        //把recvbuf转发至请求者处
+        *iSend = sendto(socket_local, recvbuf, *iRecv, 0, (sockaddr*)client_name, sizeof(*client_name));
+        auto target_ip = (char *)malloc(sizeof(char)*16);
+        hostname_to_ip(url.c_str(), target_ip);
+        result[url] = target_ip;
+        free(target_ip);
+        if (*iSend == SOCKET_ERROR) {
+            printf("sendto failed.1\n");
+            state = CONTINUE;
+            goto HELL;
+        }
+        else if (*iSend == 0) {
+            state = BREAK;
+            goto HELL;
+        }
+
+        free(pID);	//释放动态分配的内存
+    }
+
+        //在域名解析表中找到
+    else {
+        //获取请求报文的ID
+        auto pID = (unsigned short *)malloc(sizeof(unsigned short));
+        memcpy(pID, recvbuf, sizeof(unsigned short));
+
+        //转换ID
+        unsigned short nID = RegisterNewID(ntohs(*pID), *client_name, false);
+
+        //打印
+        DisplayInfo(nID, find);
+
+        //构造响应报文返回
+        memcpy(sendbuf, recvbuf, *iRecv);						//拷贝请求报文
+        unsigned short a = htons(0x8180);
+        memcpy(&sendbuf[2], &a, sizeof(unsigned short));		//修改标志域
+
+        //修改回答数域
+        a = htons(0x0001);	//服务器功能：回答数为1
+        memcpy(&sendbuf[6], &a, sizeof(unsigned short));
+        int curLen = 0;
+
+        //构造DNS响应部分
+        char answer[16] = {};
+        unsigned short Name = htons(0xc00c);
+        memcpy(answer, &Name, sizeof(unsigned short));
+        curLen += sizeof(unsigned short);
+
+        unsigned short TypeA = htons(0x0001);
+        memcpy(answer+curLen, &TypeA, sizeof(unsigned short));
+        curLen += sizeof(unsigned short);
+
+        unsigned short ClassA = htons(0x0001);
+        memcpy(answer+curLen, &ClassA, sizeof(unsigned short));
+        curLen += sizeof(unsigned short);
+
+        unsigned int timeLive = htonl(0x007b);
+        memcpy(answer+curLen, &timeLive, sizeof(unsigned int));
+        curLen += sizeof(unsigned int);
+
+        unsigned short IPLen = htons(0x0008);
+        memcpy(answer+curLen, &IPLen, sizeof(unsigned short));
+        curLen += sizeof(unsigned short);
+
+        unsigned int IP =(unsigned int) inet_addr(result[url].c_str());
+        //cout << curLen << endl;
+        //sprintf(answer+curLen, "%ud", IP);
+        memcpy(answer+curLen, &IP, sizeof(unsigned int));
+        curLen += sizeof(unsigned int);
+        curLen += *iRecv;
+        cout << curLen << endl;
+        //请求报文和响应部分共同组成DNS响应报文存入sendbuf
+        memcpy(sendbuf+*iRecv, answer, curLen);
+
+        //发送DNS响应报文
+        *iSend = sendto(socket_local, sendbuf, curLen, 0, (sockaddr*)client_name, sizeof(*client_name));
+        if (*iSend == SOCKET_ERROR) {
+            cout << "sendto Failed 2" << endl;
+        }
+        else if (*iSend == 0){
+            free(pID);
+            state = BREAK;
+            goto HELL;
+        }
+
+
+        free(pID);		//释放动态分配的内存
+    }
+    HELL:
+    url.clear();
+    return state;
+}
 
 int main(int argc, char** argv) { 
 
@@ -222,7 +371,8 @@ int main(int argc, char** argv) {
     char recvbuf[BUF_SIZE]; 
     char tablePath[100];
     char outerDns[16];
-    socklen_t iLen_cli, iSend, iRecv;
+    size_t iSend, iRecv;
+    socklen_t iLen_cli;
     int num;
 	unordered_map<string, string> &result = hosts->result_index();
 
@@ -288,132 +438,12 @@ int main(int argc, char** argv) {
 			break;
 		}
 		else {
-			GetUrl(recvbuf, iRecv);				//获取域名
-			bool find = true;		//在域名解析表中查找
-            cout << "*"<<result[url]<<"*"<<url<<"*" << endl;
-
-            if (result[url].empty())
-                find = false;
-
-			//在域名解析表中没有找到
-			if (!find) {
-				//ID转换
-				auto pID = (unsigned short *)malloc(sizeof(unsigned short));
-				memcpy(pID, recvbuf, sizeof(unsigned short));
-				unsigned short nID = htons(RegisterNewID(ntohs(*pID), client_name, false));
-				memcpy(recvbuf, &nID, sizeof(unsigned short));
-
-				//打印
-				DisplayInfo(ntohs(nID), find);
-
-				//把recvbuf转发至指定的外部DNS服务器
-				iSend = sendto(socket_server, recvbuf, iRecv, 0, (sockaddr*)&server_name, sizeof(server_name));
-				if (iSend == SOCKET_ERROR) {
-					printf("sendto failed.\n");
-					continue;
-				}
-				else if (iSend == 0)
-					break;
-
-				free(pID);	//释放动态分配的内存
-
-				//接收来自外部DNS服务器的响应报文
-				iRecv = recvfrom(socket_server, recvbuf, sizeof(recvbuf), 0, (sockaddr*)&client_name, &iLen_cli);
-
-				//ID转换
-				pID = (unsigned short *)malloc(sizeof(unsigned short));
-				memcpy(pID, recvbuf, sizeof(unsigned short));
-				int m = ntohs(*pID);
-				unsigned short oID = htons(IDTransTable[m].oldID);
-				memcpy(recvbuf, &oID, sizeof(unsigned short));
-				IDTransTable[m].done = true;
-
-				//从ID转换表中获取发出DNS请求者的信息
-				client_name = IDTransTable[m].client;
-
-				//把recvbuf转发至请求者处
-				iSend = sendto(socket_local, recvbuf, iRecv, 0, (sockaddr*)&client_name, sizeof(client_name));
-				char *target_ip = (char *)malloc(sizeof(char)*16);
-				hostname_to_ip(url.c_str(), target_ip);
-				result[url] = target_ip;
-				free(target_ip);
-				if (iSend == SOCKET_ERROR) {
-					printf("sendto failed.1\n");
-					continue;
-				}
-				else if (iSend == 0)
-					break;
-
-				free(pID);	//释放动态分配的内存
-			}
-
-			//在域名解析表中找到
-			else {	
-				//获取请求报文的ID
-				auto pID = (unsigned short *)malloc(sizeof(unsigned short));
-				memcpy(pID, recvbuf, sizeof(unsigned short));
-
-				//转换ID
-				unsigned short nID = RegisterNewID(ntohs(*pID), client_name, false);
-
-				//打印 
-				DisplayInfo(nID, find);
-
-				//构造响应报文返回
-				memcpy(sendbuf, recvbuf, iRecv);						//拷贝请求报文
-				unsigned short a = htons(0x8180);
-				memcpy(&sendbuf[2], &a, sizeof(unsigned short));		//修改标志域
-
-				//修改回答数域
-				a = htons(0x0001);	//服务器功能：回答数为1
-				memcpy(&sendbuf[6], &a, sizeof(unsigned short));
-				int curLen = 0;
-
-				//构造DNS响应部分
-				char answer[16] = {};
-				unsigned short Name = htons(0xc00c);
-				memcpy(answer, &Name, sizeof(unsigned short));
-				curLen += sizeof(unsigned short);
-
-				unsigned short TypeA = htons(0x0001);
-				memcpy(answer+curLen, &TypeA, sizeof(unsigned short));
-				curLen += sizeof(unsigned short);
-
-				unsigned short ClassA = htons(0x0001);
-				memcpy(answer+curLen, &ClassA, sizeof(unsigned short));
-				curLen += sizeof(unsigned short);
-
-				unsigned int timeLive = htonl(0x007b);
-				memcpy(answer+curLen, &timeLive, sizeof(unsigned int));
-				curLen += sizeof(unsigned int);
-
-				unsigned short IPLen = htons(0x0008);
-				memcpy(answer+curLen, &IPLen, sizeof(unsigned short));
-				curLen += sizeof(unsigned short);
-
-				unsigned int IP =(unsigned int) inet_addr(result[url].c_str());
-				cout << curLen << endl;
-				//sprintf(answer+curLen, "%ud", IP);
-				memcpy(answer+curLen, &IP, sizeof(unsigned int));
-				curLen += sizeof(unsigned int);
-				curLen += iRecv;
-
-				//请求报文和响应部分共同组成DNS响应报文存入sendbuf
-				memcpy(sendbuf+iRecv, answer, curLen);
-
-				//发送DNS响应报文
-				iSend = sendto(socket_local, sendbuf, curLen, 0, (sockaddr*)&client_name, sizeof(client_name));
-				if (iSend == SOCKET_ERROR) {
-					cout << "sendto Failed 2" << endl;
-					continue;
-				}
-				else if (iSend == 0)
-					break;
-			
-				free(pID);		//释放动态分配的内存
-			}
-
-			url.clear();
+		    auto signal = DateHandle(recvbuf, &iRecv, &iSend, &iLen_cli, &client_name,
+                                     &server_name, socket_server, socket_local, sendbuf);
+            if (CONTINUE == signal)
+                continue;
+            else if (BREAK == signal)
+                break;
 		}
 	}
 

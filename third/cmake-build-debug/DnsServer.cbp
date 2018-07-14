@@ -85,9 +85,6 @@
 		<Unit filename="/home/jyxk/Code/FreshMan/third/src/DnsDemo.cpp">
 			<Option target="DnsServer"/>
 		</Unit>
-		<Unit filename="/home/jyxk/Code/FreshMan/third/src/DnsDemo.h">
-			<Option target="DnsServer"/>
-		</Unit>
 		<Unit filename="/home/jyxk/Code/FreshMan/third/src/hosts.cpp">
 			<Option target="DnsServer"/>
 		</Unit>

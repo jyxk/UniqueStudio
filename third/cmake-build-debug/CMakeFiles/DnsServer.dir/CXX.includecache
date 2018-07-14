@@ -37,6 +37,10 @@ unistd.h
 -
 netdb.h
 -
+fcntl.h
+-
+pthread.h
+-
 hosts.h
 /home/jyxk/Code/FreshMan/third/src/hosts.h
 
